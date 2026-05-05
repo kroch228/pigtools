@@ -1859,6 +1859,324 @@ pub fn start_windsurf_default_with_args_with_new_window(
     )
 }
 
+/// Читает командную строку работающего процесса Windsurf и извлекает первый
+/// позиционный аргумент — путь к открытой рабочей папке/воркспейсу. Нужен,
+/// чтобы после перезапуска IDE (при смене аккаунта) открыть её в той же
+/// директории, что была до перезапуска.
+///
+/// Возвращает абсолютный путь к существующей директории/файлу, либо None.
+pub fn capture_workspace_arg_from_pid(pid: u32) -> Option<String> {
+    let args = read_process_argv(pid).ok()?;
+    // Пропускаем argv[0] (путь к бинарю) и ищем первый не-флаг, указывающий на
+    // существующий путь в ФС.
+    const FLAGS_WITH_VALUE: &[&str] = &[
+        "--user-data-dir",
+        "--extensions-dir",
+        "--profile",
+        "--log",
+        "--locale",
+        "--crash-reporter-id",
+        "--enable-crashpad",
+        "-g",
+        "--goto",
+        "--install-extension",
+        "--uninstall-extension",
+        "--add-mcp",
+        "--category",
+    ];
+
+    let mut iter = args.iter().skip(1).peekable();
+    while let Some(arg) = iter.next() {
+        if arg.is_empty() {
+            continue;
+        }
+        if arg.starts_with("--") {
+            let key = arg.split('=').next().unwrap_or(arg);
+            if FLAGS_WITH_VALUE.contains(&key) && !arg.contains('=') {
+                iter.next();
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            if FLAGS_WITH_VALUE.contains(&arg.as_str()) {
+                iter.next();
+            }
+            continue;
+        }
+        let candidate = Path::new(arg.as_str());
+        if candidate.exists() {
+            return Some(arg.clone());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_argv(pid: u32) -> std::io::Result<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{}/cmdline", pid))?;
+    Ok(raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn read_process_argv(pid: u32) -> std::io::Result<Vec<String>> {
+    let output = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("ps exit={}", output.status),
+        ));
+    }
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(line
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>())
+}
+
+#[cfg(target_os = "windows")]
+fn read_process_argv(pid: u32) -> std::io::Result<Vec<String>> {
+    let output = Command::new("wmic")
+        .args([
+            "process",
+            "where",
+            &format!("ProcessId={}", pid),
+            "get",
+            "CommandLine",
+            "/format:list",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("wmic exit={}", output.status),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("CommandLine="))
+        .unwrap_or("")
+        .trim();
+    // Очень упрощённо: сплит по пробелу. Пути со «space» в Windows обычно в
+    // кавычках — для таких случаев возвращаем пустой вектор и capture не
+    // сработает (не критично, фолбэк — не восстанавливать папку).
+    Ok(line
+        .split_whitespace()
+        .map(|s| s.trim_matches('"').to_string())
+        .collect())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn read_process_argv(_pid: u32) -> std::io::Result<Vec<String>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "read_process_argv не поддерживается на этой ОС",
+    ))
+}
+
+/// Оставлено для обратной совместимости — функция больше не используется,
+/// но может понадобиться для future hot-swap через keystroke injection.
+#[allow(dead_code)]
+pub fn reload_running_windsurf_window(user_data_dir: &str) -> Result<(), String> {
+    let launch_path = resolve_windsurf_launch_path()?;
+    let target = user_data_dir.trim();
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_root =
+            normalize_macos_app_root(&launch_path).ok_or("APP_PATH_NOT_FOUND:windsurf")?;
+        let mut cmd = Command::new("open");
+        sanitize_macos_gui_launch_env(&mut cmd);
+        crate::modules::process::append_managed_proxy_env_to_open_args(&mut cmd);
+        cmd.arg("-a").arg(&app_root);
+        cmd.arg("--args");
+        cmd.arg("--user-data-dir").arg(target);
+        cmd.arg("--reuse-window");
+        spawn_command_with_trace(&mut cmd)
+            .map_err(|e| format!("Фокус окна Windsurf не удался: {}", e))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut cmd = Command::new(&launch_path);
+        crate::modules::process::apply_managed_proxy_env_to_command(&mut cmd);
+        sanitize_macos_gui_launch_env(&mut cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd.arg("--user-data-dir").arg(target);
+        cmd.arg("--reuse-window");
+        spawn_command_with_trace(&mut cmd)
+            .map_err(|e| format!("Фокус окна Windsurf не удался: {}", e))?;
+    }
+
+    // Даём окну момент получить фокус после IPC.
+    std::thread::sleep(std::time::Duration::from_millis(450));
+
+    match dispatch_reload_keystrokes() {
+        Ok(tool) => modules::logger::log_info(&format!(
+            "[Windsurf HotSwap] reloadWindow отправлен через {}: dir={}",
+            tool, target
+        )),
+        Err(err) => modules::logger::log_warn(&format!(
+            "[Windsurf HotSwap] авто-перезагрузка не выполнена ({}). Нажмите в Windsurf Ctrl+Shift+P → Reload Window вручную. dir={}",
+            err, target
+        )),
+    }
+
+    Ok(())
+}
+
+/// Отправить последовательность Ctrl+Shift+P → "Reload Window" → Enter в
+/// текущее активное окно. Автоматически выбирает инструмент под сессию:
+/// ydotool (Linux/Wayland с daemon), wtype (Wayland), xdotool (X11).
+#[cfg(not(target_os = "macos"))]
+fn dispatch_reload_keystrokes() -> Result<&'static str, String> {
+    let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok() || session_type == "wayland";
+
+    let order: Vec<&'static str> = if wayland {
+        vec!["ydotool", "wtype", "xdotool"]
+    } else {
+        vec!["xdotool", "ydotool", "wtype"]
+    };
+
+    let mut last_err = String::from("нет подходящего инструмента");
+    for tool in order {
+        if which(tool).is_none() {
+            continue;
+        }
+        match send_reload_with(tool) {
+            Ok(()) => return Ok(tool),
+            Err(err) => last_err = format!("{}: {}", tool, err),
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_reload_keystrokes() -> Result<&'static str, String> {
+    // На macOS используем osascript для отправки keystroke.
+    let script = r#"
+        tell application "System Events"
+            keystroke "p" using {command down, shift down}
+            delay 0.15
+            keystroke "Reload Window"
+            delay 0.15
+            keystroke return
+        end tell
+    "#;
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+        .map_err(|e| format!("osascript: {}", e))?;
+    if !status.success() {
+        return Err(format!("osascript exit={}", status));
+    }
+    Ok("osascript")
+}
+
+fn which(tool: &str) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join(tool);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn send_reload_with(tool: &str) -> Result<(), String> {
+    match tool {
+        "ydotool" => {
+            // key codes: 29=LEFTCTRL, 42=LEFTSHIFT, 25=P, 28=ENTER
+            // формат "<code>:1" — down, "<code>:0" — up
+            let press = Command::new("ydotool")
+                .args([
+                    "key", "--", "29:1", "42:1", "25:1", "25:0", "42:0", "29:0",
+                ])
+                .status()
+                .map_err(|e| format!("spawn: {}", e))?;
+            if !press.success() {
+                return Err(format!("key Ctrl+Shift+P exit={}", press));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let typed = Command::new("ydotool")
+                .args(["type", "--", "Reload Window"])
+                .status()
+                .map_err(|e| format!("type: {}", e))?;
+            if !typed.success() {
+                return Err(format!("type exit={}", typed));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let enter = Command::new("ydotool")
+                .args(["key", "--", "28:1", "28:0"])
+                .status()
+                .map_err(|e| format!("enter: {}", e))?;
+            if !enter.success() {
+                return Err(format!("enter exit={}", enter));
+            }
+            Ok(())
+        }
+        "wtype" => {
+            let press = Command::new("wtype")
+                .args(["-M", "ctrl", "-M", "shift", "-P", "p", "-p", "p", "-m", "shift", "-m", "ctrl"])
+                .status()
+                .map_err(|e| format!("spawn: {}", e))?;
+            if !press.success() {
+                return Err(format!("chord exit={}", press));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let typed = Command::new("wtype").arg("Reload Window").status()
+                .map_err(|e| format!("type: {}", e))?;
+            if !typed.success() {
+                return Err(format!("type exit={}", typed));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let enter = Command::new("wtype").args(["-k", "Return"]).status()
+                .map_err(|e| format!("enter: {}", e))?;
+            if !enter.success() {
+                return Err(format!("enter exit={}", enter));
+            }
+            Ok(())
+        }
+        "xdotool" => {
+            let press = Command::new("xdotool")
+                .args(["key", "--delay", "60", "ctrl+shift+p"])
+                .status()
+                .map_err(|e| format!("spawn: {}", e))?;
+            if !press.success() {
+                return Err(format!("chord exit={}", press));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let typed = Command::new("xdotool")
+                .args(["type", "--delay", "20", "Reload Window"])
+                .status()
+                .map_err(|e| format!("type: {}", e))?;
+            if !typed.success() {
+                return Err(format!("type exit={}", typed));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let enter = Command::new("xdotool").args(["key", "Return"]).status()
+                .map_err(|e| format!("enter: {}", e))?;
+            if !enter.success() {
+                return Err(format!("enter exit={}", enter));
+            }
+            Ok(())
+        }
+        _ => Err(format!("неизвестный инструмент: {}", tool)),
+    }
+}
+
 fn resolve_windsurf_entry_user_data_dir_for_matching(
     dir: Option<&String>,
     default_dir: Option<&str>,

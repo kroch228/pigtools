@@ -225,13 +225,29 @@ pub async fn windsurf_start_instance(instance_id: String) -> Result<InstanceProf
         let default_dir = modules::windsurf_instance::get_default_windsurf_user_data_dir()?;
         let default_dir_str = default_dir.to_string_lossy().to_string();
         let default_settings = modules::windsurf_instance::load_default_settings()?;
+
+        // Если Windsurf уже запущен — захватываем путь открытой папки из cmdline,
+        // чтобы после перезапуска открыть IDE в той же директории.
+        let captured_workspace = modules::windsurf_instance::resolve_windsurf_pid(
+            default_settings.last_pid,
+            None,
+        )
+        .and_then(modules::windsurf_instance::capture_workspace_arg_from_pid);
+
         modules::windsurf_instance::close_windsurf(&[default_dir_str.clone()], 20)?;
         let _ = modules::windsurf_instance::update_default_pid(None)?;
         inject_bound_account_for_instance_start(
             &default_dir_str,
             default_settings.bind_account_id.as_deref(),
         )?;
-        let extra_args = modules::process::parse_extra_args(&default_settings.extra_args);
+        let mut extra_args = modules::process::parse_extra_args(&default_settings.extra_args);
+        if let Some(ws) = captured_workspace.as_ref() {
+            modules::logger::log_info(&format!(
+                "[Windsurf Restart] восстановление рабочей директории: {}",
+                ws
+            ));
+            extra_args.push(ws.clone());
+        }
         let pid = modules::windsurf_instance::start_windsurf_default_with_args_with_new_window(
             &extra_args,
             true,
@@ -262,13 +278,26 @@ pub async fn windsurf_start_instance(instance_id: String) -> Result<InstanceProf
         .find(|item| item.id == instance_id)
         .ok_or("实例不存在")?;
 
+    let captured_workspace = modules::windsurf_instance::resolve_windsurf_pid(
+        instance.last_pid,
+        Some(&instance.user_data_dir),
+    )
+    .and_then(modules::windsurf_instance::capture_workspace_arg_from_pid);
+
     modules::windsurf_instance::close_windsurf(&[instance.user_data_dir.clone()], 20)?;
     let _ = modules::windsurf_instance::update_instance_pid(&instance.id, None)?;
     inject_bound_account_for_instance_start(
         &instance.user_data_dir,
         instance.bind_account_id.as_deref(),
     )?;
-    let extra_args = modules::process::parse_extra_args(&instance.extra_args);
+    let mut extra_args = modules::process::parse_extra_args(&instance.extra_args);
+    if let Some(ws) = captured_workspace.as_ref() {
+        modules::logger::log_info(&format!(
+            "[Windsurf Restart] восстановление рабочей директории: {}",
+            ws
+        ));
+        extra_args.push(ws.clone());
+    }
     let pid = modules::windsurf_instance::start_windsurf_with_args_with_new_window(
         &instance.user_data_dir,
         &extra_args,
