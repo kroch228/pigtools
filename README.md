@@ -62,8 +62,8 @@ curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
 
 # 4. Клонирование и сборка
-git clone https://github.com/kroch228/cockpit-tools.git
-cd cockpit-tools
+git clone https://github.com/kroch228/pigtools.git
+cd pigtools
 npm install
 npm run tauri build -- --bundles deb
 
@@ -91,8 +91,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 
 # 3. Сборка
-git clone https://github.com/kroch228/cockpit-tools.git
-cd cockpit-tools
+git clone https://github.com/kroch228/pigtools.git
+cd pigtools
 npm install
 npm run tauri build -- --bundles deb
 
@@ -153,7 +153,7 @@ cockpit-tools
 ## Обновление
 
 ```bash
-cd cockpit-tools
+cd pigtools
 git pull
 npm install
 npm run tauri build -- --bundles deb
@@ -168,4 +168,4 @@ sudo dpkg -i "target/release/bundle/deb/Cockpit Tools_"*"_amd64.deb"
 
 ## Issues
 
-Если что-то не собирается / не работает — открой issue: <https://github.com/kroch228/cockpit-tools/issues>
+Если что-то не собирается / не работает — открой issue: <https://github.com/kroch228/pigtools/issues>
